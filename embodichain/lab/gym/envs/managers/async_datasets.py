@@ -113,8 +113,19 @@ class AsyncLeRobotRecorder(LeRobotRecorder):
 
         # Single-worker queue. A single worker guarantees LeRobotDataset is
         # only ever touched from one thread (it is not thread-safe) and keeps
-        # episode ordering deterministic.
-        self._save_queue: "queue.Queue[Optional[tuple]]" = queue.Queue()
+        # episode ordering deterministic. The queue is bounded so a slow
+        # worker applies backpressure instead of piling up cloned episodes in
+        # host RAM.
+        max_pending = int(cfg.params.get("max_pending_episodes", 2))
+        self._save_queue: "queue.Queue[Optional[tuple]]" = queue.Queue(
+            maxsize=max_pending
+        )
+        # Episodes handed to the worker so far. Unlike ``curr_episode`` (which
+        # only advances once the worker has persisted an episode), this is
+        # updated synchronously, so collection loops can count saves right
+        # after ``env.reset()``.
+        self.num_submitted: int = 0
+        self._worker_error: Optional[BaseException] = None
         self._worker: threading.Thread = threading.Thread(
             target=self._worker_loop,
             name="AsyncLeRobotRecorder-worker",
@@ -137,10 +148,21 @@ class AsyncLeRobotRecorder(LeRobotRecorder):
             try:
                 self._save_single_episode(env_id, obs_clone, action_clone)
             except Exception as e:  # noqa: BLE001 - worker must not die
-                logger.log_error(
+                if self._worker_error is None:
+                    self._worker_error = e
+                print(
                     f"[AsyncLeRobotRecorder] Background worker failed on "
-                    f"env {env_id}: {e}"
+                    f"env {env_id}: {e}",
+                    flush=True,
                 )
+
+    def _raise_worker_error(self) -> None:
+        """Re-raise the first background save failure in the caller's thread."""
+        if self._worker_error is not None:
+            err, self._worker_error = self._worker_error, None
+            raise RuntimeError(
+                f"AsyncLeRobotRecorder background save failed: {err}"
+            ) from err
 
     def __call__(
         self,
@@ -180,6 +202,8 @@ class AsyncLeRobotRecorder(LeRobotRecorder):
         if len(env_ids) == 0:
             return
 
+        self._raise_worker_error()
+
         step = env.current_rollout_step
         for env_id in env_ids.cpu().tolist():
             obs_view = env.rollout_buffer["obs"][env_id, :step]
@@ -190,6 +214,7 @@ class AsyncLeRobotRecorder(LeRobotRecorder):
             obs_clone = obs_view.clone().cpu()
             action_clone = action_view.clone().cpu()
             self._save_queue.put((env_id, obs_clone, action_clone))
+            self.num_submitted += 1
 
     def finalize(self) -> Optional[str]:
         """Drain the background worker, then finalize the dataset.
@@ -201,5 +226,6 @@ class AsyncLeRobotRecorder(LeRobotRecorder):
         # Signal the worker to exit once the queue is drained.
         self._save_queue.put(None)
         self._worker.join()
+        self._raise_worker_error()
         # Parent flushes leftover episodes, stops image writer, finalizes.
         return super().finalize()

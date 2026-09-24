@@ -126,6 +126,14 @@ class LeRobotRecorder(Functor):
         self.image_writer_threads = int(params.get("image_writer_threads", 0))
         self.image_writer_processes = int(params.get("image_writer_processes", 0))
 
+        # LeRobot streaming video encoding: frames are encoded to MP4 by
+        # per-camera encoder threads as they are added, so no PNG round-trip
+        # through disk happens at save_episode() time.
+        self.streaming_encoding = bool(params.get("streaming_encoding", False))
+        self.encoder_queue_maxsize = int(params.get("encoder_queue_maxsize", 30))
+        encoder_threads = params.get("encoder_threads", None)
+        self.encoder_threads = None if encoder_threads is None else int(encoder_threads)
+
         # Compressed depth sidecar videos (issue #424, Path A). When enabled and
         # an HEVC encoder is available, camera depth is written as gray12le/HEVC
         # MP4s alongside the LeRobot dataset instead of (or, with
@@ -282,6 +290,14 @@ class LeRobotRecorder(Functor):
                                 del frame[key]
                 self.dataset.add_frame(frame)
 
+            encoder = getattr(self.dataset, "_streaming_encoder", None)
+            dropped = getattr(encoder, "_dropped_frames", None)
+            if dropped:
+                raise RuntimeError(
+                    f"Streaming encoder dropped frames {dict(dropped)}; "
+                    "increase encoder_queue_maxsize."
+                )
+
             self.dataset.save_episode()
             if self._depth_manager is not None:
                 self._depth_manager.end_episode(self.curr_episode)
@@ -429,6 +445,9 @@ class LeRobotRecorder(Functor):
             metadata_buffer_size=1,
             image_writer_processes=self.image_writer_processes,
             image_writer_threads=self.image_writer_threads,
+            streaming_encoding=self.streaming_encoding,
+            encoder_queue_maxsize=self.encoder_queue_maxsize,
+            encoder_threads=self.encoder_threads,
         )
         logger.log_info(f"Created LeRobot dataset at: {self.dataset_full_path}")
 

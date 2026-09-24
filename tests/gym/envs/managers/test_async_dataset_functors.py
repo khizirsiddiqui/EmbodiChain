@@ -211,3 +211,74 @@ class TestAsyncLeRobotRecorder:
 
         assert mock_ds.save_episode_calls == 1
         assert mock_ds.finalize_calls == 1
+
+    def test_num_submitted_updates_synchronously(self):
+        """``num_submitted`` counts enqueued episodes right after ``__call__``."""
+        env = _MockEnv(num_envs=2, steps=3)
+        mock_ds = _MockDataset()
+        recorder = _make_recorder(env, mock_ds)
+
+        assert recorder.num_submitted == 0
+        recorder(env, env_ids=torch.tensor([0, 1]))
+        assert recorder.num_submitted == 2
+
+        env.current_rollout_step = 0
+        recorder.finalize()
+
+    def test_queue_is_bounded(self):
+        """The pending-episode queue must apply backpressure, not grow."""
+        env = _MockEnv(num_envs=1, steps=2)
+        recorder = _make_recorder(env, _MockDataset())
+        try:
+            assert recorder._save_queue.maxsize == 2
+        finally:
+            env.current_rollout_step = 0
+            recorder.finalize()
+
+    def test_worker_error_is_raised_in_caller(self):
+        """A failed background save must surface on the next call/finalize."""
+        env = _MockEnv(num_envs=1, steps=2)
+        mock_ds = _MockDataset()
+
+        def _boom(*args, **kwargs):
+            raise ValueError("disk full")
+
+        mock_ds.save_episode = _boom
+        recorder = _make_recorder(env, mock_ds)
+
+        recorder(env, env_ids=torch.tensor([0]))
+        env.current_rollout_step = 0
+
+        with pytest.raises(RuntimeError, match="background save failed"):
+            recorder.finalize()
+
+    def test_streaming_params_forwarded_to_create(self):
+        """streaming_encoding params must reach LeRobotDataset.create."""
+        from embodichain.lab.gym.envs.managers.cfg import DatasetFunctorCfg
+
+        env = _MockEnv(num_envs=1, steps=1)
+        cfg = DatasetFunctorCfg(
+            func=AsyncLeRobotRecorder,
+            params={
+                "save_path": "/tmp/test_async_recorder",
+                "robot_meta": {"robot_type": "test", "control_freq": 30},
+                "instruction": {"lang": "test"},
+                "extra": {"scene_type": "s", "task_description": "t"},
+                "use_videos": False,
+                "streaming_encoding": True,
+                "encoder_queue_maxsize": 123,
+                "encoder_threads": 4,
+            },
+        )
+        with patch(
+            "embodichain.lab.gym.envs.managers.datasets.LeRobotDataset"
+        ) as mock_cls:
+            mock_cls.create.return_value = _MockDataset()
+            recorder = AsyncLeRobotRecorder(cfg, env)
+            kwargs = mock_cls.create.call_args.kwargs
+        env.current_rollout_step = 0
+        recorder.finalize()
+
+        assert kwargs["streaming_encoding"] is True
+        assert kwargs["encoder_queue_maxsize"] == 123
+        assert kwargs["encoder_threads"] == 4
